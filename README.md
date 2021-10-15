@@ -1,3 +1,7 @@
+This fork adds support for the Modbus Encapsulated Interface Transport function code (0x2b).
+Please find hereunder the unmodified original README.md.
+
+
 A groovy modbus library
 =======================
 
