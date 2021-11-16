@@ -70,6 +70,7 @@ MODBUS_BEGIN_DECLS
 #define MODBUS_FC_REPORT_SLAVE_ID           0x11
 #define MODBUS_FC_MASK_WRITE_REGISTER       0x16
 #define MODBUS_FC_WRITE_AND_READ_REGISTERS  0x17
+#define MODBUS_FC_ENCAPS_INTERF_TRANSP      0x2B
 
 #define MODBUS_BROADCAST_ADDRESS    0
 
@@ -126,7 +127,8 @@ enum {
     MODBUS_EXCEPTION_NOT_DEFINED,
     MODBUS_EXCEPTION_GATEWAY_PATH,
     MODBUS_EXCEPTION_GATEWAY_TARGET,
-    MODBUS_EXCEPTION_MAX
+    MODBUS_EXCEPTION_MAX,
+    MODBUS_EXTENDED_EXCEPTION = 0xFF
 };
 
 #define EMBXILFUN  (MODBUS_ENOBASE + MODBUS_EXCEPTION_ILLEGAL_FUNCTION)
@@ -139,6 +141,7 @@ enum {
 #define EMBXMEMPAR (MODBUS_ENOBASE + MODBUS_EXCEPTION_MEMORY_PARITY)
 #define EMBXGPATH  (MODBUS_ENOBASE + MODBUS_EXCEPTION_GATEWAY_PATH)
 #define EMBXGTAR   (MODBUS_ENOBASE + MODBUS_EXCEPTION_GATEWAY_TARGET)
+#define EMBXEXTEXC (MODBUS_ENOBASE + MODBUS_EXTENDED_EXCEPTION)
 
 /* Native libmodbus error codes */
 #define EMBBADCRC  (EMBXGTAR + 1)
@@ -216,6 +219,9 @@ MODBUS_API int modbus_write_and_read_registers(modbus_t *ctx, int write_addr, in
                                                const uint16_t *src, int read_addr, int read_nb,
                                                uint16_t *dest);
 MODBUS_API int modbus_report_slave_id(modbus_t *ctx, int max_dest, uint8_t *dest);
+MODBUS_API int modbus_encapsulated_interface_transport(modbus_t *ctx, int mei_type,
+                                                       int byte_size_data_in, const uint8_t *data_in,
+                                                       int *byte_size_data_out, uint8_t *data_out);
 
 MODBUS_API modbus_mapping_t* modbus_mapping_new_start_address(
     unsigned int start_bits, unsigned int nb_bits,

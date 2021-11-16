@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
+#include <assert.h>
 #ifndef _MSC_VER
 #include <unistd.h>
 #endif
@@ -63,6 +64,8 @@ const char *modbus_strerror(int errnum) {
         return "Gateway path unavailable";
     case EMBXGTAR:
         return "Target device failed to respond";
+    case EMBXEXTEXC:
+        return "Extended exception";
     case EMBBADCRC:
         return "Invalid CRC";
     case EMBBADDATA:
@@ -125,6 +128,54 @@ int modbus_flush(modbus_t *ctx)
     return rc;
 }
 
+static int compute_data_length_after_meta_for_eit_msg(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type)
+{
+    const int fc_offset = ctx->backend->header_length;
+    
+    uint8_t mei_type = msg[fc_offset + 1];
+    if (mei_type != 0x0d) {  // currently only CANopen General Reference Command supported
+        return -1;
+    }
+
+    uint8_t protocol_control_0 = msg[fc_offset + 2];
+    uint8_t access_flag = protocol_control_0 & 1;  // 0 = read, 1 = write
+
+    int pos = fc_offset + 2 + 2 + 6;
+    int nr_data_values = (msg[pos] << 8) | msg[pos + 1];
+
+    int data_length = 0;
+    if (msg_type == MSG_INDICATION && access_flag == 1) {           // write request
+        data_length = nr_data_values;
+    }
+    else if (msg_type == MSG_CONFIRMATION && access_flag == 0) {    // read response
+        data_length = nr_data_values;
+    }
+
+    return data_length;
+}
+
+static int compute_response_length_from_request_for_eit_msg(modbus_t* ctx, uint8_t* req)
+{
+    const int fc_offset = ctx->backend->header_length;
+
+    uint8_t mei_type = req[fc_offset + 1];
+    if (mei_type != 0x0d) {  // currently only CANopen General Reference Command supported
+        return -1;
+    }
+
+    uint8_t protocol_control_0 = req[fc_offset + 2];
+    uint8_t access_flag = protocol_control_0 & 1;  // 0 = read, 1 = write
+
+    int pos = fc_offset + 2 + 2 + 6;
+    int nr_data_values = (req[pos] << 8) | req[pos + 1];
+
+    int rsp_length = 12;
+    if (access_flag == 0) { // read request
+        rsp_length += nr_data_values;
+    }
+    return rsp_length;
+}
+
 /* Computes the length of the expected response */
 static unsigned int compute_response_length_from_request(modbus_t *ctx, uint8_t *req)
 {
@@ -144,6 +195,9 @@ static unsigned int compute_response_length_from_request(modbus_t *ctx, uint8_t 
     case MODBUS_FC_READ_INPUT_REGISTERS:
         /* Header + 2 * nb values */
         length = 2 + 2 * (req[offset + 3] << 8 | req[offset + 4]);
+        break;
+    case MODBUS_FC_ENCAPS_INTERF_TRANSP:
+        length = compute_response_length_from_request_for_eit_msg(ctx, req);
         break;
     case MODBUS_FC_READ_EXCEPTION_STATUS:
         length = 3;
@@ -264,6 +318,9 @@ static uint8_t compute_meta_length_after_function(int function,
             length = 6;
         } else if (function == MODBUS_FC_WRITE_AND_READ_REGISTERS) {
             length = 9;
+        }
+        else if (function == MODBUS_FC_ENCAPS_INTERF_TRANSP) {
+            length = 11;
         } else {
             /* MODBUS_FC_READ_EXCEPTION_STATUS, MODBUS_FC_REPORT_SLAVE_ID */
             length = 0;
@@ -279,6 +336,9 @@ static uint8_t compute_meta_length_after_function(int function,
             break;
         case MODBUS_FC_MASK_WRITE_REGISTER:
             length = 6;
+            break;
+        case MODBUS_FC_ENCAPS_INTERF_TRANSP:
+            length = 11;
             break;
         default:
             length = 1;
@@ -304,6 +364,9 @@ static int compute_data_length_after_meta(modbus_t *ctx, uint8_t *msg,
         case MODBUS_FC_WRITE_AND_READ_REGISTERS:
             length = msg[ctx->backend->header_length + 9];
             break;
+        case MODBUS_FC_ENCAPS_INTERF_TRANSP:
+            length = compute_data_length_after_meta_for_eit_msg(ctx, msg, msg_type);
+            break;
         default:
             length = 0;
         }
@@ -313,6 +376,9 @@ static int compute_data_length_after_meta(modbus_t *ctx, uint8_t *msg,
             function == MODBUS_FC_REPORT_SLAVE_ID ||
             function == MODBUS_FC_WRITE_AND_READ_REGISTERS) {
             length = msg[ctx->backend->header_length + 1];
+        }
+        else if (function == MODBUS_FC_ENCAPS_INTERF_TRANSP) {
+            length = compute_data_length_after_meta_for_eit_msg(ctx, msg, msg_type);
         } else {
             length = 0;
         }
@@ -531,19 +597,24 @@ static int check_confirmation(modbus_t *ctx, uint8_t *req,
 
     /* Exception code */
     if (function >= 0x80) {
-        if (rsp_length == (offset + 2 + (int)ctx->backend->checksum_length) &&
+        const int min_length_rsp = offset + 2 + (int)ctx->backend->checksum_length;
+        if (rsp_length >= min_length_rsp &&
             req[offset] == (rsp[offset] - 0x80)) {
             /* Valid exception code received */
 
             int exception_code = rsp[offset + 1];
-            if (exception_code < MODBUS_EXCEPTION_MAX) {
+            if (rsp_length == min_length_rsp && exception_code < MODBUS_EXCEPTION_MAX) {
                 errno = MODBUS_ENOBASE + exception_code;
-            } else {
+            } else if (rsp_length > min_length_rsp && exception_code == MODBUS_EXTENDED_EXCEPTION) {
+                errno = MODBUS_ENOBASE + exception_code;
+            }
+            else {
                 errno = EMBBADEXC;
             }
             _error_print(ctx, NULL);
             return -1;
-        } else {
+        } 
+        else {
             errno = EMBBADEXC;
             _error_print(ctx, NULL);
             return -1;
@@ -918,6 +989,7 @@ int modbus_reply(modbus_t *ctx, const uint8_t *req,
     }
         break;
     case MODBUS_FC_READ_EXCEPTION_STATUS:
+    case MODBUS_FC_ENCAPS_INTERF_TRANSP:
         if (ctx->debug) {
             fprintf(stderr, "FIXME Not implemented\n");
         }
@@ -1556,6 +1628,60 @@ int modbus_report_slave_id(modbus_t *ctx, int max_dest, uint8_t *dest)
         for (i=0; i < rc && i < max_dest; i++) {
             dest[i] = rsp[offset + i];
         }
+    }
+
+    return rc;
+}
+
+/* Encapsulated Interface Transport (FC 0x2b): encapsulates direct access to CANopen object dict */
+int modbus_encapsulated_interface_transport(modbus_t *ctx, int mei_type,
+                                            int byte_size_data_in, const uint8_t *data_in,
+                                            int *byte_size_data_out, uint8_t *data_out)
+{
+    int rc;
+
+    uint8_t req[MAX_MESSAGE_LENGTH];
+
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (mei_type != 0x0d) {
+        if (ctx->debug) {
+            fprintf(stderr,
+                "ERROR Unsupported MEI type (%d)\n",
+                mei_type);
+        }
+        errno = EMBMDATA;
+        return -1;
+    }
+
+    // dummy values for addr and nb (N/A here)
+    ctx->backend->build_request_basis(ctx, MODBUS_FC_ENCAPS_INTERF_TRANSP, 0, 0, req);
+
+    int req_length = ctx->backend->header_length + 1;
+
+    req[req_length++] = (uint8_t)mei_type;
+
+    memcpy(req + req_length, data_in, byte_size_data_in);
+    req_length += byte_size_data_in;
+
+    rc = send_msg(ctx, req, req_length);
+    if (rc > 0) {
+        uint8_t rsp[MAX_MESSAGE_LENGTH];
+
+        rc = _modbus_receive_msg(ctx, rsp, MSG_CONFIRMATION);
+        if (rc == -1)
+            return -1;
+
+        rc = check_confirmation(ctx, req, rsp, rc);
+        if (rc == -1)
+            return -1;
+
+        int offset_data = ctx->backend->header_length + 2;  // skip FC and MEI type;
+        *byte_size_data_out = 10 + compute_data_length_after_meta_for_eit_msg(ctx, rsp, MSG_CONFIRMATION);
+        memcpy(data_out, rsp + offset_data, *byte_size_data_out);
     }
 
     return rc;
